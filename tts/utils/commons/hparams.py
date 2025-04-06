@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 import re
-
+import ast
 import yaml
 
 global_print_hparams = True
@@ -59,7 +59,7 @@ def parse_config(v, context=None):
         match = re.match(r"\${(.*)}", v)
         if match:
             expression = match.group(1)
-            return eval(expression, {}, context)
+            return ast.literal_eval(expression, {}, context)
     return v
 
 
@@ -172,7 +172,7 @@ def set_hparams(config='', exp_name='', hparams_str='', print_hparams=True, glob
                             tp = type(config_node[k][0]) if len(config_node[k]) else str
                             config_node[k] = [tp(x) for x in v.split("|") if x != '']
                             continue
-                    config_node[k] = eval(v)
+                    config_node[k] = ast.literal_eval(v)
                 else:
                     config_node[k] = type(config_node[k])(v)
             else:

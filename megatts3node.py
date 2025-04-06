@@ -277,7 +277,7 @@ class MegaTTS3DiTInfer():
                 # Apply hamming window
                 wav_pred_.append(wav_pred)
 
-            wav_pred = combine_audio_segments(wav_pred_, sr=self.sr).astype(float)
+            wav_pred = combine_audio_segments(wav_pred_, sr=self.sr).astype(np.float32)
             waveform = torch.tensor(wav_pred).unsqueeze(0).unsqueeze(0)
 
             return {"waveform": waveform, "sample_rate": self.sr}

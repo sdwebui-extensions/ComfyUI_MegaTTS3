@@ -1,30 +1,17 @@
 import json
 import os
-import librosa
 import numpy as np
 import torch
 
 # from tn.chinese.normalizer import Normalizer as ZhNormalizer
 # from tn.english.normalizer import Normalizer as EnNormalizer
 # from langdetect import detect as classify_language
-import pyloudnorm as pyln
 import folder_paths
 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
-
-from tts.modules.ar_dur.commons.nar_tts_modules import LengthRegulator
-from tts.frontend_function import g2p, align, make_dur_prompt, dur_pred, prepare_inputs_for_dit
-from tts.utils.audio_utils.io import save_wav, to_wav_bytes, convert_to_wav_bytes, combine_audio_segments
-from tts.utils.commons.ckpt_utils import load_ckpt
-from tts.utils.commons.hparams import set_hparams, hparams
-from tts.utils.text_utils.text_encoder import TokenTextEncoder
-from tts.utils.text_utils.split_text import chunk_text_chinese, chunk_text_english
-from tts.utils.commons.hparams import hparams, set_hparams
-
-
 
 models_dir = folder_paths.models_dir
 model_path = os.path.join(models_dir, "TTS")
@@ -92,6 +79,7 @@ class MegaTTS3DiTInfer():
             precision=torch.float16,
             **kwargs
         ):
+        import pyloudnorm as pyln
         self.sr = 24000
         self.fm = 8
         if device is None:
@@ -100,6 +88,8 @@ class MegaTTS3DiTInfer():
         self.precision = precision
 
         # build models
+        if not os.path.exists(os.path.join(ckpt_root, dit_exp_name)) and os.path.exists(os.path.exists("/stable-diffusion-cache/models/ByteDance")):
+            ckpt_root = "/stable-diffusion-cache/models/ByteDance/MegaTTS3"
         self.dit_exp_name = os.path.join(ckpt_root, dit_exp_name)
         self.frontend_exp_name = os.path.join(ckpt_root, frontend_exp_name)
         self.wavvae_exp_name = os.path.join(ckpt_root, wavvae_exp_name)
@@ -124,7 +114,10 @@ class MegaTTS3DiTInfer():
         torch.cuda.empty_cache()
 
     def build_model(self, device):
+        from MegaTTS3.utils.commons.hparams import hparams, set_hparams
         set_hparams(exp_name=self.dit_exp_name, print_hparams=False)
+        from MegaTTS3.utils.commons.ckpt_utils import load_ckpt
+        from MegaTTS3.utils.text_utils.text_encoder import TokenTextEncoder
 
         ''' Load Dict '''
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,7 +127,8 @@ class MegaTTS3DiTInfer():
         ph_dict_size = len(token_encoder)
 
         ''' Load Duration LM '''
-        from tts.modules.ar_dur.ar_dur_predictor import ARDurPredictor
+        from MegaTTS3.modules.ar_dur.ar_dur_predictor import ARDurPredictor
+        from MegaTTS3.modules.ar_dur.commons.nar_tts_modules import LengthRegulator
         hp_dur_model = self.hp_dur_model = set_hparams(f'{self.dur_exp_name}/config.yaml', global_hparams=False)
         hp_dur_model['frames_multiple'] = hparams['frames_multiple']
         self.dur_model = ARDurPredictor(
@@ -148,7 +142,7 @@ class MegaTTS3DiTInfer():
         self.dur_model.to(device)
 
         ''' Load Diffusion Transformer '''
-        from tts.modules.llm_dit.dit import Diffusion
+        from MegaTTS3.modules.llm_dit.dit import Diffusion
         self.dit = Diffusion()
         load_ckpt(self.dit, f'{self.dit_exp_name}', 'dit', strict=False)
         self.dit.eval()
@@ -157,7 +151,7 @@ class MegaTTS3DiTInfer():
         self.cfg_mask_token_tone = 32 - 1
 
         ''' Load Frontend LM '''
-        from tts.modules.aligner.whisper_small import Whisper
+        from MegaTTS3.modules.aligner.whisper_small import Whisper
         self.aligner_lm = Whisper()
         load_ckpt(self.aligner_lm, f'{self.frontend_exp_name}', 'model')
         self.aligner_lm.eval()
@@ -175,7 +169,7 @@ class MegaTTS3DiTInfer():
 
         ''' Wav VAE '''
         self.hp_wavvae = hp_wavvae = set_hparams(f'{self.wavvae_exp_name}/config.yaml', global_hparams=False)
-        from tts.modules.wavvae.decoder.wavvae_v3 import WavVAE_V3
+        from MegaTTS3.modules.wavvae.decoder.wavvae_v3 import WavVAE_V3
         self.wavvae = WavVAE_V3(hparams=hp_wavvae)
         if os.path.exists(f'{self.wavvae_exp_name}/model_only_last.ckpt'):
             load_ckpt(self.wavvae, f'{self.wavvae_exp_name}/model_only_last.ckpt', 'model_gen', strict=True)
@@ -189,7 +183,11 @@ class MegaTTS3DiTInfer():
         self.hop_size = hp_wavvae.get('hop_size', 4)
     
     def preprocess(self, audio_bytes, latent_file=None, topk_dur=1, **kwargs):
+        from MegaTTS3.utils.audio_utils.io import convert_to_wav_bytes
+        from MegaTTS3.utils.commons.hparams import hparams
+        import librosa
         wav_bytes = convert_to_wav_bytes(audio_bytes)
+        from MegaTTS3.frontend_function import align, make_dur_prompt
 
         ''' Load wav '''
         wav, _ = librosa.core.load(wav_bytes, sr=self.sr)
@@ -229,6 +227,10 @@ class MegaTTS3DiTInfer():
 
     def forward(self, resource_context, input_text, language_type, time_step, p_w, t_w, dur_disturb=0.1, dur_alpha=1.0, **kwargs):
         device = self.device
+        import pyloudnorm as pyln
+        from MegaTTS3.frontend_function import g2p, dur_pred, prepare_inputs_for_dit
+        from MegaTTS3.utils.audio_utils.io import combine_audio_segments
+        from MegaTTS3.utils.text_utils.split_text import chunk_text_chinese, chunk_text_english
 
         ph_ref = resource_context['ph_ref'].to(device)
         tone_ref = resource_context['tone_ref'].to(device)

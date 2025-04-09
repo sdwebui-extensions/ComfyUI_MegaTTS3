@@ -17,9 +17,9 @@ import torch
 from typing import Optional, Tuple
 from torch import nn
 from torch.nn import Parameter, Linear
-from tts.modules.ar_dur.commons.layers import LayerNorm, Embedding
-from tts.modules.ar_dur.commons.transformer import TransformerFFNLayer, MultiheadAttention
-from tts.modules.ar_dur.commons.seq_utils import get_incremental_state, set_incremental_state, softmax, make_positions
+from MegaTTS3.modules.ar_dur.commons.layers import LayerNorm, Embedding
+from MegaTTS3.modules.ar_dur.commons.transformer import TransformerFFNLayer, MultiheadAttention
+from MegaTTS3.modules.ar_dur.commons.seq_utils import get_incremental_state, set_incremental_state, softmax, make_positions
 import torch.nn.functional as F
 
 DEFAULT_MAX_SOURCE_POSITIONS = 3000

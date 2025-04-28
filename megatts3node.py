@@ -3,6 +3,8 @@ import os
 import librosa
 import numpy as np
 import torch
+import torchaudio
+from typing import List, Union, Optional
 
 # from tn.chinese.normalizer import Normalizer as ZhNormalizer
 # from tn.english.normalizer import Normalizer as EnNormalizer
@@ -23,7 +25,6 @@ from tts.utils.commons.hparams import set_hparams, hparams
 from tts.utils.text_utils.text_encoder import TokenTextEncoder
 from tts.utils.text_utils.split_text import chunk_text_chinese, chunk_text_english
 from tts.utils.commons.hparams import hparams, set_hparams
-
 
 
 models_dir = folder_paths.models_dir
@@ -70,13 +71,66 @@ model_path = os.path.join(models_dir, "TTS")
 
 #     return wav_buffer.getvalue()
 
+def get_all_files(
+    root_dir: str,
+    return_type: str = "list",
+    extensions: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    relative_path: bool = False
+) -> Union[List[str], dict]:
+    """
+    递归获取目录下所有文件路径
+    
+    :param root_dir: 要遍历的根目录
+    :param return_type: 返回类型 - "list"(列表) 或 "dict"(按目录分组)
+    :param extensions: 可选的文件扩展名过滤列表 (如 ['.py', '.txt'])
+    :param exclude_dirs: 要排除的目录名列表 (如 ['__pycache__', '.git'])
+    :param relative_path: 是否返回相对路径 (相对于root_dir)
+    :return: 文件路径列表或字典
+    """
+    file_paths = []
+    file_dict = {}
+    
+    # 规范化目录路径
+    root_dir = os.path.normpath(root_dir)
+    
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # 处理排除目录
+        if exclude_dirs:
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+        
+        current_files = []
+        for filename in filenames:
+            # 扩展名过滤
+            if extensions:
+                if not any(filename.lower().endswith(ext.lower()) for ext in extensions):
+                    continue
+            
+            # 构建完整路径
+            full_path = os.path.join(dirpath, filename)
+            
+            # 处理相对路径
+            if relative_path:
+                full_path = os.path.relpath(full_path, root_dir)
+            
+            current_files.append(full_path)
+        
+        if return_type == "dict":
+            # 使用相对路径或绝对路径作为键
+            dict_key = os.path.relpath(dirpath, root_dir) if relative_path else dirpath
+            if current_files:
+                file_dict[dict_key] = current_files
+        else:
+            file_paths.extend(current_files)
+    
+    return file_dict if return_type == "dict" else file_paths
+
 def get_speakers():
     speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
     if not os.path.exists(speakers_dir):
         os.makedirs(speakers_dir, exist_ok=True)
         return []
-    
-    speakers = [f for f in os.listdir(speakers_dir) if f.endswith('.wav')]
+    speakers = get_all_files(speakers_dir, extensions=[".wav"], relative_path=True)
     return speakers
 
 class MegaTTS3DiTInfer():
@@ -282,17 +336,40 @@ class MegaTTS3DiTInfer():
 
             return {"waveform": waveform, "sample_rate": self.sr}
 
-
-class MegaTTS3Run:
-    infer_ins_cache = None
+class MegaTTS3SpeakersPreview:
+    def __init__(self):
+        self.speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
     @classmethod
     def INPUT_TYPES(s):
         speakers = get_speakers()
-        default_speaker = speakers[0] if speakers else ""
+        return {
+            "required": {"speaker":(speakers,),},}
+
+    RETURN_TYPES = ("STRING", "AUDIO",)
+    RETURN_NAMES = ("speaker", "AUDIO",)
+    FUNCTION = "preview"
+    CATEGORY = "🎤MW/MW-MegaTTS3"
+
+    def preview(self, speaker):
+        wav_path = os.path.join(self.speakers_dir, speaker)
+        waveform, sample_rate = torchaudio.load(wav_path)
+        waveform = waveform.unsqueeze(0)
+        output_audio = {
+            "waveform": waveform,
+            "sample_rate": sample_rate
+        }
+        return (wav_path, output_audio,)
+
+class MegaTTS3Run:
+    def __init__(self):
+        self.infer_ins_cache = None
+        self.speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
+    @classmethod
+    def INPUT_TYPES(s):
         return {
             "required": {
-                "speaker":(speakers,{"default": default_speaker}),
-                "text": ("STRING",),
+                "speaker":("STRING", {"forceInput": True}),
+                "text": ("STRING", {"forceInput": True}),
                 "text_language": (["en", "zh"], {"default": "zh"}),
                 "time_step": ("INT", {"default": 32, "min": 1,}),
                 "p_w": ("FLOAT", {"default":1.6, "min": 0.1,}),
@@ -307,26 +384,25 @@ class MegaTTS3Run:
     CATEGORY = "🎤MW/MW-MegaTTS3"
 
     def clone(self, speaker, text, text_language, time_step, p_w, t_w, unload_model):
-        sperker_path = os.path.join(model_path, "MegaTTS3", "speakers", speaker)
-        if MegaTTS3Run.infer_ins_cache is not None:
-            infer_ins = MegaTTS3Run.infer_ins_cache
-        else:
-            infer_ins = MegaTTS3Run.infer_ins_cache = MegaTTS3DiTInfer()
+        sperker_path = speaker
+        if self.infer_ins_cache is None:
+            self.infer_ins_cache = MegaTTS3DiTInfer()
+
         with open(sperker_path, 'rb') as file:
             file_content = file.read()
 
         latent_file = sperker_path.replace('.wav', '.npy')
-        print(f"latent_file: {latent_file}")
+
         if os.path.exists(latent_file):
-            resource_context = infer_ins.preprocess(file_content, latent_file=latent_file)
+            resource_context = self.infer_ins_cache.preprocess(file_content, latent_file=latent_file)
         else:
-            raise Exception("latent_file not found")
-        audio_data = infer_ins.forward(resource_context, text, language_type=text_language, time_step=time_step, p_w=p_w, t_w=t_w)
+            raise Exception(f"{latent_file}: latent_file not found")
+        audio_data = self.infer_ins_cache.forward(resource_context, text, language_type=text_language, time_step=time_step, p_w=p_w, t_w=t_w)
 
         if unload_model:
             import gc
-            infer_ins.clean()
-            infer_ins = None
+            self.infer_ins_cache.clean()
+            self.infer_ins_cache = None
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -355,11 +431,13 @@ class MultiLinePromptMG:
 
 
 NODE_CLASS_MAPPINGS = {
+    "MegaTTS3SpeakersPreview": MegaTTS3SpeakersPreview,
     "MegaTTS3Run": MegaTTS3Run,
     "MultiLinePromptMG": MultiLinePromptMG,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "MegaTTS3SpeakersPreview": "MegaTTS3 Speakers Preview",
     "MegaTTS3Run": "Mega TTS3 Run",
     "MultiLinePromptMG": "Multi Line Prompt",
 }

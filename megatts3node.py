@@ -4,7 +4,9 @@ import librosa
 import numpy as np
 import torch
 import torchaudio
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict
+import re
+import logging
 
 # from tn.chinese.normalizer import Normalizer as ZhNormalizer
 # from tn.english.normalizer import Normalizer as EnNormalizer
@@ -133,6 +135,132 @@ def get_speakers():
     speakers = get_all_files(speakers_dir, extensions=[".wav"], relative_path=True)
     return speakers
 
+
+class SimpleNormalizer:
+    """
+    Minimalist text normalizer.
+    - Normalizes common punctuation for both ZH and EN (maps 。 to .).
+    - For ZH:
+        - Converts '.' to '点' ONLY between digits (e.g., "1.2" -> "1点2").
+        - Converts remaining digits (0-9) to Chinese characters (零-九).
+    - For EN: Converts text to lowercase.
+    """
+
+    # --- Shared Normalization Maps ---
+
+    # Punctuation mapping (Applied BEFORE language-specific logic)
+    # CRITICAL: Do NOT map '.' here. Map '。' to '.'
+    # Map other common variants.
+    _PUNC_MAP: Dict[str, str] = {
+        # Punctuation
+        "，": ",", "、": ",",
+        "。": ".", # Map full-width period to standard dot
+        "？": "?", "?": "?",
+        "！": "!", "!": "!",
+        "；": ",", ";": ",",
+        "：": ":",
+        # Quotes
+        "“": "'", "”": "'", '"': "'",
+        "‘": "'", "’": "'",
+        # Brackets
+        "（": "(", "）": ")",
+        "《": "'", "》": "'",
+        "【": "[", "】": "]",
+        "「": "'", "」": "'",
+        # Dashes / Connectors
+        "—": "-", "～": "-", "~": "-", "·": "-",
+        # Whitespace
+        "\n": " ", "\t": " ", "\r": " ", "\u3000": " ",
+    }
+
+    # Multi-character sequences (Applied FIRST)
+    _MULTI_CHAR_REP_MAP: Dict[str, str] = {
+        "...": "...", # Normalize to standard ellipsis first
+        "......": "...",
+        "…": "...", # Map unicode ellipsis to dots
+    }
+
+    # --- Language-Specific Maps (used in logic) ---
+
+    # Chinese digit mapping
+    _ZH_DIGIT_MAP: Dict[str, str] = {
+        "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+        "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+    }
+
+
+    def __init__(self, lang: str = "zh"):
+        """
+        Initializes the SimpleNormalizer.
+
+        Args:
+            lang (str): The target language ('zh' or 'en'). Defaults to 'zh'.
+        """
+        if lang not in ["zh", "en"]:
+            raise ValueError(f"Unsupported language: {lang}. Supported: 'zh', 'en'")
+        self.lang = lang
+
+        # Prepare translation table ONLY for general punctuation (context-free)
+        # Digits and the context-dependent dot (for ZH) are handled later.
+        self._translation_table = str.maketrans(self._PUNC_MAP)
+
+    def _zh_digit_replacer(self, match: re.Match) -> str:
+        """Helper function to replace a matched digit with its Chinese char."""
+        return self._ZH_DIGIT_MAP[match.group(0)]
+
+    def normalize(self, text: str) -> str:
+        """
+        Performs text normalization based on the initialized language.
+
+        Args:
+            text (str): The input text to normalize.
+
+        Returns:
+            str: The normalized text.
+        """
+        if not isinstance(text, str):
+            logging.warning(f"Input is not a string: {type(text)}. Returning as is.")
+            return text
+        if not text:
+            return ""
+
+        # --- Normalization Steps ---
+
+        # 1. Basic cleanup (Null bytes)
+        text = text.replace('\x00', '')
+
+        # 2. Multi-character replacements (Ellipsis normalization - applied first)
+        for old, new in self._MULTI_CHAR_REP_MAP.items():
+            text = text.replace(old, new)
+
+        # 3. Apply general punctuation translation (context-free part)
+        #    Maps 。 to . but leaves . as is for now.
+        text = text.translate(self._translation_table)
+
+        # 4. Language-specific processing
+        if self.lang == "zh":
+            # --- Chinese Specific ---
+            # 4a. Convert decimal points: Replace '.' between digits with '点'
+            #     Uses lookbehind (?<=\d) and lookahead (?=\d) to ensure digits are adjacent
+            #     Alternatively, capture groups: re.sub(r'(\d)\.(\d)', r'\1点\2', text)
+            text = re.sub(r'(?<=\d)\.(?=\d)', '点', text) # e.g., "1.2" -> "1点2"
+
+            # 4b. Convert remaining digits 0-9 to 零-九
+            #     Uses re.sub with a function to look up the character
+            text = re.sub(r'\d', self._zh_digit_replacer, text) # e.g., "1点2" -> "一点二"
+
+        elif self.lang == "en":
+            # --- English Specific ---
+            # 4a. Lowercase
+            text = text.lower()
+            # Note: '.' remains '.' because it wasn't converted in step 3 or ZH steps.
+
+        # 5. Final Whitespace normalization (consolidate & trim)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
+
 class MegaTTS3DiTInfer():
     def __init__(
             self, 
@@ -164,7 +292,10 @@ class MegaTTS3DiTInfer():
         # init text normalizer
         # self.zh_normalizer = ZhNormalizer(overwrite_cache=False, remove_erhua=False, remove_interjections=False)
         # self.en_normalizer = EnNormalizer(overwrite_cache=False)
-        
+
+        self.zh_normalizer = SimpleNormalizer(lang='zh')
+        self.en_normalizer = SimpleNormalizer(lang='en')
+
         # loudness meter
         self.loudness_meter = pyln.Meter(self.sr)
         
@@ -296,10 +427,10 @@ class MegaTTS3DiTInfer():
             wav_pred_ = []
             # language_type = classify_language(input_text)
             if language_type == 'en':
-                # input_text = self.en_normalizer.normalize(input_text)
+                input_text = self.en_normalizer.normalize(input_text)
                 text_segs = chunk_text_english(input_text, max_chars=130)
             else:
-                # input_text = self.zh_normalizer.normalize(input_text)
+                input_text = self.zh_normalizer.normalize(input_text)
                 text_segs = chunk_text_chinese(input_text, limit=60)
 
             for seg_i, text in enumerate(text_segs):

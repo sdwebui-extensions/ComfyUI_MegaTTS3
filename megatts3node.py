@@ -137,42 +137,6 @@ def get_speakers():
 
 
 class SimpleNormalizer:
-    """
-    Minimalist text normalizer.
-    - Normalizes common punctuation for both ZH and EN (maps 。 to .).
-    - For ZH:
-        - Converts '.' to '点' ONLY between digits (e.g., "1.2" -> "1点2").
-        - Converts remaining digits (0-9) to Chinese characters (零-九).
-    - For EN: Converts text to lowercase.
-    """
-
-    # --- Shared Normalization Maps ---
-
-    # Punctuation mapping (Applied BEFORE language-specific logic)
-    # CRITICAL: Do NOT map '.' here. Map '。' to '.'
-    # Map other common variants.
-    _PUNC_MAP: Dict[str, str] = {
-        # Punctuation
-        "，": ",", "、": ",",
-        "。": ".", # Map full-width period to standard dot
-        "？": "?", "?": "?",
-        "！": "!", "!": "!",
-        "；": ",", ";": ",",
-        "：": ":",
-        # Quotes
-        "“": "'", "”": "'", '"': "'",
-        "‘": "'", "’": "'",
-        # Brackets
-        "（": "(", "）": ")",
-        "《": "'", "》": "'",
-        "【": "[", "】": "]",
-        "「": "'", "」": "'",
-        # Dashes / Connectors
-        "—": "-", "～": "-", "~": "-", "·": "-",
-        # Whitespace
-        "\n": " ", "\t": " ", "\r": " ", "\u3000": " ",
-    }
-
     # Multi-character sequences (Applied FIRST)
     _MULTI_CHAR_REP_MAP: Dict[str, str] = {
         "...": "...", # Normalize to standard ellipsis first
@@ -200,10 +164,6 @@ class SimpleNormalizer:
             raise ValueError(f"Unsupported language: {lang}. Supported: 'zh', 'en'")
         self.lang = lang
 
-        # Prepare translation table ONLY for general punctuation (context-free)
-        # Digits and the context-dependent dot (for ZH) are handled later.
-        self._translation_table = str.maketrans(self._PUNC_MAP)
-
     def _zh_digit_replacer(self, match: re.Match) -> str:
         """Helper function to replace a matched digit with its Chinese char."""
         return self._ZH_DIGIT_MAP[match.group(0)]
@@ -226,36 +186,22 @@ class SimpleNormalizer:
 
         # --- Normalization Steps ---
 
-        # 1. Basic cleanup (Null bytes)
+        # Basic cleanup (Null bytes)
         text = text.replace('\x00', '')
 
-        # 2. Multi-character replacements (Ellipsis normalization - applied first)
+        # Multi-character replacements (Ellipsis normalization - applied first)
         for old, new in self._MULTI_CHAR_REP_MAP.items():
             text = text.replace(old, new)
 
-        # 3. Apply general punctuation translation (context-free part)
-        #    Maps 。 to . but leaves . as is for now.
-        text = text.translate(self._translation_table)
-
-        # 4. Language-specific processing
+        #  Language-specific processing
         if self.lang == "zh":
-            # --- Chinese Specific ---
-            # 4a. Convert decimal points: Replace '.' between digits with '点'
-            #     Uses lookbehind (?<=\d) and lookahead (?=\d) to ensure digits are adjacent
-            #     Alternatively, capture groups: re.sub(r'(\d)\.(\d)', r'\1点\2', text)
             text = re.sub(r'(?<=\d)\.(?=\d)', '点', text) # e.g., "1.2" -> "1点2"
-
-            # 4b. Convert remaining digits 0-9 to 零-九
-            #     Uses re.sub with a function to look up the character
             text = re.sub(r'\d', self._zh_digit_replacer, text) # e.g., "1点2" -> "一点二"
 
         elif self.lang == "en":
-            # --- English Specific ---
-            # 4a. Lowercase
             text = text.lower()
             # Note: '.' remains '.' because it wasn't converted in step 3 or ZH steps.
 
-        # 5. Final Whitespace normalization (consolidate & trim)
         text = re.sub(r'\s+', ' ', text).strip()
 
         return text
@@ -495,6 +441,8 @@ class MegaTTS3Run:
     def __init__(self):
         self.infer_ins_cache = None
         self.speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
+        self.resource_context = None
+        self.speaker = None
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -515,17 +463,22 @@ class MegaTTS3Run:
     CATEGORY = "🎤MW/MW-MegaTTS3"
 
     def clone(self, speaker, text, text_language, time_step, p_w, t_w, unload_model):
-        sperker_path = speaker
         if self.infer_ins_cache is None:
             self.infer_ins_cache = MegaTTS3DiTInfer()
 
-        with open(sperker_path, 'rb') as file:
-            file_content = file.read()
-
-        latent_file = sperker_path.replace('.wav', '.npy')
+        latent_file = speaker.replace('.wav', '.npy')
 
         if os.path.exists(latent_file):
-            resource_context = self.infer_ins_cache.preprocess(file_content, latent_file=latent_file)
+
+            # 只有音频改变时, 才重新预处理
+            if self.speaker is None or self.speaker != speaker:
+                self.speaker = speaker
+                with open(self.speaker, 'rb') as file:
+                    file_content = file.read()
+                resource_context = self.infer_ins_cache.preprocess(file_content, latent_file=latent_file)
+                self.resource_context = resource_context
+            else:
+                resource_context = self.resource_context
         else:
             raise Exception(f"{latent_file}: latent_file not found")
         audio_data = self.infer_ins_cache.forward(resource_context, text, language_type=text_language, time_step=time_step, p_w=p_w, t_w=t_w)
@@ -534,6 +487,8 @@ class MegaTTS3Run:
             import gc
             self.infer_ins_cache.clean()
             self.infer_ins_cache = None
+            self.speaker = None
+            self.resource_context = None
             gc.collect()
             torch.cuda.empty_cache()
 

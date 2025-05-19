@@ -8,6 +8,8 @@ High-quality voice cloning, supports Chinese and English, and can perform cross-
 
 ## 📣 Updates
 
+[2025-04-28]⚒️: Add a preview voice node, preview the voice first, and then clone if satisfied. Thank you `@chenpipi0807` for your idea 😍. You can create more folders by categorizing them under the `speakers` folder.
+
 [2025-04-06]⚒️: Released v1.0.0.
 
 ## Installation

@@ -2,6 +2,10 @@ import json
 import os
 import numpy as np
 import torch
+import torchaudio
+from typing import List, Union, Optional, Dict
+import re
+import logging
 
 # from tn.chinese.normalizer import Normalizer as ZhNormalizer
 # from tn.english.normalizer import Normalizer as EnNormalizer
@@ -12,6 +16,7 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
+
 
 models_dir = folder_paths.models_dir
 model_path = os.path.join(models_dir, "TTS")
@@ -57,14 +62,139 @@ model_path = os.path.join(models_dir, "TTS")
 
 #     return wav_buffer.getvalue()
 
+def get_all_files(
+    root_dir: str,
+    return_type: str = "list",
+    extensions: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    relative_path: bool = False
+) -> Union[List[str], dict]:
+    """
+    递归获取目录下所有文件路径
+    
+    :param root_dir: 要遍历的根目录
+    :param return_type: 返回类型 - "list"(列表) 或 "dict"(按目录分组)
+    :param extensions: 可选的文件扩展名过滤列表 (如 ['.py', '.txt'])
+    :param exclude_dirs: 要排除的目录名列表 (如 ['__pycache__', '.git'])
+    :param relative_path: 是否返回相对路径 (相对于root_dir)
+    :return: 文件路径列表或字典
+    """
+    file_paths = []
+    file_dict = {}
+    
+    # 规范化目录路径
+    root_dir = os.path.normpath(root_dir)
+    
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # 处理排除目录
+        if exclude_dirs:
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+        
+        current_files = []
+        for filename in filenames:
+            # 扩展名过滤
+            if extensions:
+                if not any(filename.lower().endswith(ext.lower()) for ext in extensions):
+                    continue
+            
+            # 构建完整路径
+            full_path = os.path.join(dirpath, filename)
+            
+            # 处理相对路径
+            if relative_path:
+                full_path = os.path.relpath(full_path, root_dir)
+            
+            current_files.append(full_path)
+        
+        if return_type == "dict":
+            # 使用相对路径或绝对路径作为键
+            dict_key = os.path.relpath(dirpath, root_dir) if relative_path else dirpath
+            if current_files:
+                file_dict[dict_key] = current_files
+        else:
+            file_paths.extend(current_files)
+    
+    return file_dict if return_type == "dict" else file_paths
+
 def get_speakers():
     speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
     if not os.path.exists(speakers_dir):
         os.makedirs(speakers_dir, exist_ok=True)
         return []
-    
-    speakers = [f for f in os.listdir(speakers_dir) if f.endswith('.wav')]
+    speakers = get_all_files(speakers_dir, extensions=[".wav"], relative_path=True)
     return speakers
+
+
+class SimpleNormalizer:
+    # Multi-character sequences (Applied FIRST)
+    _MULTI_CHAR_REP_MAP: Dict[str, str] = {
+        "...": "...", # Normalize to standard ellipsis first
+        "......": "...",
+        "…": "...", # Map unicode ellipsis to dots
+    }
+
+    # --- Language-Specific Maps (used in logic) ---
+
+    # Chinese digit mapping
+    _ZH_DIGIT_MAP: Dict[str, str] = {
+        "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+        "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+    }
+
+
+    def __init__(self, lang: str = "zh"):
+        """
+        Initializes the SimpleNormalizer.
+
+        Args:
+            lang (str): The target language ('zh' or 'en'). Defaults to 'zh'.
+        """
+        if lang not in ["zh", "en"]:
+            raise ValueError(f"Unsupported language: {lang}. Supported: 'zh', 'en'")
+        self.lang = lang
+
+    def _zh_digit_replacer(self, match: re.Match) -> str:
+        """Helper function to replace a matched digit with its Chinese char."""
+        return self._ZH_DIGIT_MAP[match.group(0)]
+
+    def normalize(self, text: str) -> str:
+        """
+        Performs text normalization based on the initialized language.
+
+        Args:
+            text (str): The input text to normalize.
+
+        Returns:
+            str: The normalized text.
+        """
+        if not isinstance(text, str):
+            logging.warning(f"Input is not a string: {type(text)}. Returning as is.")
+            return text
+        if not text:
+            return ""
+
+        # --- Normalization Steps ---
+
+        # Basic cleanup (Null bytes)
+        text = text.replace('\x00', '')
+
+        # Multi-character replacements (Ellipsis normalization - applied first)
+        for old, new in self._MULTI_CHAR_REP_MAP.items():
+            text = text.replace(old, new)
+
+        #  Language-specific processing
+        if self.lang == "zh":
+            text = re.sub(r'(?<=\d)\.(?=\d)', '点', text) # e.g., "1.2" -> "1点2"
+            text = re.sub(r'\d', self._zh_digit_replacer, text) # e.g., "1点2" -> "一点二"
+
+        elif self.lang == "en":
+            text = text.lower()
+            # Note: '.' remains '.' because it wasn't converted in step 3 or ZH steps.
+
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
 
 class MegaTTS3DiTInfer():
     def __init__(
@@ -100,7 +230,10 @@ class MegaTTS3DiTInfer():
         # init text normalizer
         # self.zh_normalizer = ZhNormalizer(overwrite_cache=False, remove_erhua=False, remove_interjections=False)
         # self.en_normalizer = EnNormalizer(overwrite_cache=False)
-        
+
+        self.zh_normalizer = SimpleNormalizer(lang='zh')
+        self.en_normalizer = SimpleNormalizer(lang='en')
+
         # loudness meter
         self.loudness_meter = pyln.Meter(self.sr)
         
@@ -244,10 +377,10 @@ class MegaTTS3DiTInfer():
             wav_pred_ = []
             # language_type = classify_language(input_text)
             if language_type == 'en':
-                # input_text = self.en_normalizer.normalize(input_text)
+                input_text = self.en_normalizer.normalize(input_text)
                 text_segs = chunk_text_english(input_text, max_chars=130)
             else:
-                # input_text = self.zh_normalizer.normalize(input_text)
+                input_text = self.zh_normalizer.normalize(input_text)
                 text_segs = chunk_text_chinese(input_text, limit=60)
 
             for seg_i, text in enumerate(text_segs):
@@ -284,17 +417,42 @@ class MegaTTS3DiTInfer():
 
             return {"waveform": waveform, "sample_rate": self.sr}
 
-
-class MegaTTS3Run:
-    infer_ins_cache = None
+class MegaTTS3SpeakersPreview:
+    def __init__(self):
+        self.speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
     @classmethod
     def INPUT_TYPES(s):
         speakers = get_speakers()
-        default_speaker = speakers[0] if speakers else ""
+        return {
+            "required": {"speaker":(speakers,),},}
+
+    RETURN_TYPES = ("STRING", "AUDIO",)
+    RETURN_NAMES = ("speaker", "AUDIO",)
+    FUNCTION = "preview"
+    CATEGORY = "🎤MW/MW-MegaTTS3"
+
+    def preview(self, speaker):
+        wav_path = os.path.join(self.speakers_dir, speaker)
+        waveform, sample_rate = torchaudio.load(wav_path)
+        waveform = waveform.unsqueeze(0)
+        output_audio = {
+            "waveform": waveform,
+            "sample_rate": sample_rate
+        }
+        return (wav_path, output_audio,)
+
+class MegaTTS3Run:
+    def __init__(self):
+        self.infer_ins_cache = None
+        self.speakers_dir = os.path.join(model_path, "MegaTTS3", "speakers")
+        self.resource_context = None
+        self.speaker = None
+    @classmethod
+    def INPUT_TYPES(s):
         return {
             "required": {
-                "speaker":(speakers,{"default": default_speaker}),
-                "text": ("STRING",),
+                "speaker":("STRING", {"forceInput": True}),
+                "text": ("STRING", {"forceInput": True}),
                 "text_language": (["en", "zh"], {"default": "zh"}),
                 "time_step": ("INT", {"default": 32, "min": 1,}),
                 "p_w": ("FLOAT", {"default":1.6, "min": 0.1,}),
@@ -309,26 +467,32 @@ class MegaTTS3Run:
     CATEGORY = "🎤MW/MW-MegaTTS3"
 
     def clone(self, speaker, text, text_language, time_step, p_w, t_w, unload_model):
-        sperker_path = os.path.join(model_path, "MegaTTS3", "speakers", speaker)
-        if MegaTTS3Run.infer_ins_cache is not None:
-            infer_ins = MegaTTS3Run.infer_ins_cache
-        else:
-            infer_ins = MegaTTS3Run.infer_ins_cache = MegaTTS3DiTInfer()
-        with open(sperker_path, 'rb') as file:
-            file_content = file.read()
+        if self.infer_ins_cache is None:
+            self.infer_ins_cache = MegaTTS3DiTInfer()
 
-        latent_file = sperker_path.replace('.wav', '.npy')
-        print(f"latent_file: {latent_file}")
+        latent_file = speaker.replace('.wav', '.npy')
+
         if os.path.exists(latent_file):
-            resource_context = infer_ins.preprocess(file_content, latent_file=latent_file)
+
+            # 只有音频改变时, 才重新预处理
+            if self.speaker is None or self.speaker != speaker:
+                self.speaker = speaker
+                with open(self.speaker, 'rb') as file:
+                    file_content = file.read()
+                resource_context = self.infer_ins_cache.preprocess(file_content, latent_file=latent_file)
+                self.resource_context = resource_context
+            else:
+                resource_context = self.resource_context
         else:
-            raise Exception("latent_file not found")
-        audio_data = infer_ins.forward(resource_context, text, language_type=text_language, time_step=time_step, p_w=p_w, t_w=t_w)
+            raise Exception(f"{latent_file}: latent_file not found")
+        audio_data = self.infer_ins_cache.forward(resource_context, text, language_type=text_language, time_step=time_step, p_w=p_w, t_w=t_w)
 
         if unload_model:
             import gc
-            infer_ins.clean()
-            infer_ins = None
+            self.infer_ins_cache.clean()
+            self.infer_ins_cache = None
+            self.speaker = None
+            self.resource_context = None
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -357,11 +521,13 @@ class MultiLinePromptMG:
 
 
 NODE_CLASS_MAPPINGS = {
+    "MegaTTS3SpeakersPreview": MegaTTS3SpeakersPreview,
     "MegaTTS3Run": MegaTTS3Run,
     "MultiLinePromptMG": MultiLinePromptMG,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "MegaTTS3SpeakersPreview": "MegaTTS3 Speakers Preview",
     "MegaTTS3Run": "Mega TTS3 Run",
     "MultiLinePromptMG": "Multi Line Prompt",
 }
